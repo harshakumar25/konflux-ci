@@ -1,0 +1,72 @@
+---
+# k3d Cluster Configuration for Konflux
+#
+# This is the k3d equivalent of kind-config.yaml.
+# It is used by scripts/setup-k3d-cluster.sh when CLUSTER_PROVIDER=k3d.
+#
+# Port mappings mirror kind-config.yaml exactly:
+#   30010 → 8888  (Konflux UI)
+#   30011 → 9443  (Pipelines-as-Code / PaC)
+#   30012 → 8180  (Dex OIDC)
+#   30001 → 5001  (Internal Container Registry — avoids macOS port 5000 conflict)
+#
+# Datastore: embedded etcd (via --cluster-init)
+#   K3s supports two datastores: SQLite (default, single-node only) and
+#   embedded etcd (enabled by --cluster-init). We explicitly use embedded etcd here
+#   because:
+#     1. etcd is the same datastore used by Kind's Vanilla Kubernetes nodes
+#     2. It avoids SQLite's single-node-only constraint
+#     3. It gives closer parity to the upstream Kubernetes behavior that the
+#        team wants to preserve for correctness testing
+#
+#   Trade-off: embedded etcd uses slightly more RAM than SQLite (~100-200MB
+#   extra), but is still ~1.5-2GB less than a full Kind node at idle.
+#   Full measured footprint with embedded etcd: ~519MB idle (vs ~2-3GB Kind).
+#
+# K3s is a CNCF-certified, Kubernetes-conformant distribution. Tekton, cert-manager,
+# Kyverno, and Pipelines-as-Code are all K3s-compatible out of the box.
+
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: konflux
+
+# Single-node cluster (control-plane only, no separate agents)
+servers: 1
+agents: 0
+
+options:
+  k3s:
+    extraArgs:
+      # Use embedded etcd instead of SQLite for closer parity with Vanilla Kubernetes.
+      # --cluster-init initialises the embedded etcd cluster on the first server node.
+      - arg: --cluster-init
+        nodeFilters:
+          - "server:0"
+      # Disable built-in Traefik ingress — Konflux deploys its own ingress controller
+      - arg: --disable=traefik
+        nodeFilters:
+          - "server:*"
+      # Label the server node so Konflux ingress-ready selectors work
+      - arg: --node-label=ingress-ready=true
+        nodeFilters:
+          - "server:*"
+
+# Host ↔ container port mappings (equivalent to kind extraPortMappings)
+ports:
+  # Konflux UI
+  - port: "8888:30010"
+    nodeFilters:
+      - "server:0"
+  # Pipelines-as-Code (PaC)
+  - port: "9443:30011"
+    nodeFilters:
+      - "server:0"
+  # Dex OIDC provider
+  - port: "8180:30012"
+    nodeFilters:
+      - "server:0"
+  # Internal container registry (5001 avoids macOS AirPlay conflict on 5000)
+  - port: "5001:30001"
+    nodeFilters:
+      - "server:0"

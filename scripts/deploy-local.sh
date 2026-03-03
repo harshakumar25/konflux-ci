@@ -91,10 +91,12 @@ ENABLE_REGISTRY_PORT="${ENABLE_REGISTRY_PORT:-1}"
 INCREASE_PODMAN_PIDS_LIMIT="${INCREASE_PODMAN_PIDS_LIMIT:-1}"
 OPERATOR_INSTALL_METHOD="${OPERATOR_INSTALL_METHOD:-release}"
 OPERATOR_IMAGE="${OPERATOR_IMAGE:-quay.io/konflux-ci/konflux-operator:latest}"
+# Cluster provider: 'kind' (default) or 'k3d' (lower memory, recommended on macOS)
+CLUSTER_PROVIDER="${CLUSTER_PROVIDER:-kind}"
 
 # Export variables for child scripts
 export KIND_CLUSTER KIND_MEMORY_GB PODMAN_MACHINE_NAME REGISTRY_HOST_PORT ENABLE_REGISTRY_PORT
-export INCREASE_PODMAN_PIDS_LIMIT
+export INCREASE_PODMAN_PIDS_LIMIT CLUSTER_PROVIDER
 export GITHUB_PRIVATE_KEY GITHUB_APP_ID WEBHOOK_SECRET QUAY_TOKEN QUAY_ORGANIZATION
 
 # Get Konflux CR file path (precedence, high->low: command-line arg, env var, default)
@@ -171,11 +173,15 @@ if [ "${INSTALL_METHOD}" = "build" ]; then
     echo ""
 fi
 
-# Step 1: Setup Kind cluster
+# Step 1: Setup cluster (provider: kind or k3d)
 echo "========================================="
-echo "Step 1: Creating Kind cluster"
+echo "Step 1: Creating ${CLUSTER_PROVIDER} cluster"
 echo "========================================="
-"${SCRIPT_DIR}/setup-kind-local-cluster.sh"
+if [[ "${CLUSTER_PROVIDER}" == "k3d" ]]; then
+    "${SCRIPT_DIR}/setup-k3d-cluster.sh"
+else
+    "${SCRIPT_DIR}/setup-kind-local-cluster.sh"
+fi
 
 # Step 2: Deploy dependencies
 echo ""
@@ -221,9 +227,13 @@ case "${INSTALL_METHOD}" in
         ;;
 
     build)
-        echo "Loading operator image into Kind cluster..."
+        echo "Loading operator image into ${CLUSTER_PROVIDER} cluster..."
         cd "${REPO_ROOT}/operator"
-        kind load docker-image "${OPERATOR_IMG}" --name "${KIND_CLUSTER}"
+        if [[ "${CLUSTER_PROVIDER}" == "k3d" ]]; then
+            k3d image import "${OPERATOR_IMG}" --cluster "${KIND_CLUSTER}"
+        else
+            kind load docker-image "${OPERATOR_IMG}" --name "${KIND_CLUSTER}"
+        fi
 
         echo "Installing CRDs..."
         make install
