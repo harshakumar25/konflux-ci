@@ -1,0 +1,177 @@
+# Smoke test: k3d cluster on macOS GitHub runner
+#
+# PURPOSE: Verify whether Docker + k3d can work on GitHub's macOS runners.
+# This is an experimental workflow to answer the question:
+#   "Did you try running the e2e tests in CI in your fork?"
+#
+# KNOWN LIMITATION:
+#   GitHub does not officially support Docker on macOS runners.
+#   - macos-14/15 (ARM64 M1): No nested virtualization → Docker/Colima fails
+#   - macos-13 (Intel x86_64): Docker removed, but Colima may still work
+#   - macos-13 is being retired Dec 2025
+#
+# This workflow tries macos-13 with Colima as a Docker runtime.
+# If it fails, that proves the platform limitation is real.
+# If it works, we have CI proof of the k3d prototype.
+
+name: k3d macOS Smoke Test
+
+on:
+  push:
+    branches:
+      - k3d-macos-prototype
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  test-k3d-macos:
+    name: k3d Smoke Test (macOS)
+    runs-on: macos-13  # Intel x86_64 — only runner where Docker might work
+    timeout-minutes: 30
+    env:
+      KIND_CLUSTER: konflux-ci-test
+      CLUSTER_PROVIDER: k3d
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: System info
+        run: |
+          echo "=== macOS Version ==="
+          sw_vers
+          echo ""
+          echo "=== Architecture ==="
+          uname -m
+          echo ""
+          echo "=== Memory ==="
+          sysctl -n hw.memsize | awk '{printf "Total RAM: %.1f GB\n", $1/1024/1024/1024}'
+          echo ""
+          echo "=== CPU ==="
+          sysctl -n hw.ncpu | awk '{printf "CPUs: %s\n", $1}'
+
+      - name: Install Docker via Colima
+        run: |
+          echo "=== Installing Colima and Docker CLI ==="
+          brew install colima docker
+          echo ""
+          echo "=== Starting Colima VM (8GB RAM, 4 CPUs) ==="
+          # Allocate 8 GB to the VM — leaves ~6 GB for the host
+          colima start --memory 8 --cpu 4 --disk 20
+          echo ""
+          echo "=== Verify Docker ==="
+          docker info
+          docker version
+
+      - name: Install k3d
+        run: |
+          brew install k3d
+          k3d version
+
+      - name: Create k3d cluster with embedded etcd
+        run: |
+          echo "=== Creating k3d cluster ==="
+          CLUSTER_PROVIDER=k3d KIND_CLUSTER=$KIND_CLUSTER \
+            bash scripts/setup-k3d-cluster.sh
+
+      - name: Verify cluster health
+        run: |
+          echo "=== Cluster info ==="
+          kubectl cluster-info --context k3d-${KIND_CLUSTER}
+          echo ""
+          echo "=== Nodes (look for 'etcd' in ROLES) ==="
+          kubectl get nodes -o wide --context k3d-${KIND_CLUSTER}
+          echo ""
+          echo "=== System pods ==="
+          kubectl get pods -A --context k3d-${KIND_CLUSTER}
+
+      - name: Memory baseline (idle cluster)
+        run: |
+          echo "=== Container memory (idle) ==="
+          docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}"
+
+      - name: Deploy Konflux dependencies
+        run: |
+          echo "=== Running deploy-deps.sh ==="
+          ./deploy-deps.sh
+        timeout-minutes: 15
+
+      - name: Verify all deployments
+        run: |
+          echo "=== All pods ==="
+          kubectl get pods -A --context k3d-${KIND_CLUSTER}
+          echo ""
+          echo "=== Deployment status ==="
+          kubectl get deployments -A --context k3d-${KIND_CLUSTER}
+          echo ""
+          echo "=== Check for non-Running pods ==="
+          NOT_RUNNING=$(kubectl get pods -A --context k3d-${KIND_CLUSTER} --no-headers | grep -v "Running\|Completed" | wc -l | tr -d ' ')
+          echo "Non-running pods: ${NOT_RUNNING}"
+          if [ "${NOT_RUNNING}" -gt 0 ]; then
+            echo "WARNING: Some pods are not running"
+            kubectl get pods -A --context k3d-${KIND_CLUSTER} --no-headers | grep -v "Running\|Completed"
+          fi
+
+      - name: Memory after full deployment
+        run: |
+          echo "=== Container memory (post deploy-deps) ==="
+          docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}"
+          echo ""
+          echo "=== Colima VM stats ==="
+          colima status
+
+      - name: Service reachability check
+        run: |
+          echo "=== Dex (port 8180) ==="
+          curl -s -o /dev/null -w "HTTP %{http_code}" http://localhost:8180/.well-known/openid-configuration || echo "Dex not reachable"
+          echo ""
+          echo "=== Registry (port 5001) ==="
+          curl -sk -o /dev/null -w "HTTP %{http_code}" https://localhost:5001/v2/ || echo "Registry not reachable (expected for TLS)"
+          echo ""
+          echo "=== UI (port 8888) ==="
+          curl -s -o /dev/null -w "HTTP %{http_code}" http://localhost:8888 || echo "UI not reachable"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo ""
+          echo "============================================"
+          echo "  k3d macOS CI Smoke Test — Summary"
+          echo "============================================"
+          echo ""
+          echo "Runner:       macos-13 (Intel x86_64)"
+          echo "Docker via:   Colima"
+          echo "k3d version:  $(k3d version | head -1)"
+          echo "Cluster:      ${KIND_CLUSTER}"
+          echo ""
+          echo "Node roles:"
+          kubectl get nodes --context k3d-${KIND_CLUSTER} --no-headers 2>/dev/null || echo "  Cluster not available"
+          echo ""
+          echo "Pod summary:"
+          kubectl get pods -A --context k3d-${KIND_CLUSTER} --no-headers 2>/dev/null | awk '{print $4}' | sort | uniq -c || echo "  No data"
+          echo ""
+          echo "Memory:"
+          docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}" 2>/dev/null || echo "  No data"
+
+      - name: Generate error logs on failure
+        if: failure()
+        run: |
+          echo "=== Cluster state ==="
+          k3d cluster list || true
+          echo ""
+          echo "=== Docker containers ==="
+          docker ps -a || true
+          echo ""
+          echo "=== Colima status ==="
+          colima status || true
+          echo ""
+          echo "=== Colima logs (last 50 lines) ==="
+          colima log 2>&1 | tail -50 || true
+          echo ""
+          echo "=== Pod events ==="
+          kubectl get events -A --sort-by='.lastTimestamp' --context k3d-${KIND_CLUSTER} 2>/dev/null | tail -30 || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          k3d cluster delete ${KIND_CLUSTER} 2>/dev/null || true
+          colima stop 2>/dev/null || true
