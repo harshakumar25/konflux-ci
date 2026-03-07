@@ -82,13 +82,59 @@ jobs:
           echo "  CPUs:   ${COLIMA_CPU}"
           echo "  Disk:   ${COLIMA_DISK} GB"
           echo ""
-          # Use QEMU on Intel — Colima needs a Linux VM to provide Docker
-          colima start \
-            --memory "${COLIMA_MEMORY}" \
-            --cpu "${COLIMA_CPU}" \
-            --disk "${COLIMA_DISK}" \
-            --vm-type qemu \
-            --mount-type 9p
+
+          # Try Virtualization.framework first (vz), fall back to QEMU.
+          # Known issue: QEMU hangs on macos-15-intel starting with 15.7.1
+          # https://github.com/actions/runner-images/issues/11636
+          start_colima() {
+            local vm_type="$1"
+            echo "Attempting colima start with --vm-type ${vm_type}..."
+            timeout 180 colima start \
+              --memory "${COLIMA_MEMORY}" \
+              --cpu "${COLIMA_CPU}" \
+              --disk "${COLIMA_DISK}" \
+              --vm-type "${vm_type}" \
+              --mount-type virtiofs 2>&1 || return 1
+            return 0
+          }
+
+          # Attempt 1: vz (Apple Virtualization.framework — native, no QEMU needed)
+          if ! start_colima vz; then
+            echo ""
+            echo "⚠️  vz backend failed. Logs:"
+            cat ~/.colima/_lima/colima/ha.stderr.log 2>/dev/null || true
+            echo ""
+
+            # Cleanup before retry
+            colima delete --force 2>/dev/null || true
+
+            # Attempt 2: QEMU (fallback)
+            echo "Retrying with QEMU backend..."
+            if ! start_colima qemu; then
+              echo ""
+              echo "❌ Both vz and QEMU backends failed."
+              echo ""
+              echo "=== Colima logs ==="
+              cat ~/.colima/_lima/colima/ha.stderr.log 2>/dev/null || true
+              echo ""
+              echo "=== Lima logs ==="
+              ls -la ~/.colima/_lima/colima/ 2>/dev/null || true
+              cat ~/.colima/_lima/colima/serial*.log 2>/dev/null | tail -50 || true
+              exit 1
+            fi
+          fi
+
+          echo ""
+          echo "=== Waiting for Docker to be ready ==="
+          for i in $(seq 1 30); do
+            if docker info &>/dev/null; then
+              echo "Docker is ready (attempt ${i})"
+              break
+            fi
+            echo "Waiting for Docker... (${i}/30)"
+            sleep 2
+          done
+
           echo ""
           echo "=== Verify Docker ==="
           docker info
