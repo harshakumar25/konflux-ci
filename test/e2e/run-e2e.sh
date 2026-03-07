@@ -13,8 +13,20 @@ main() {
     local catalog_revision="${RELEASE_SERVICE_CATALOG_REVISION:?RELEASE_SERVICE_CATALOG_REVISION must be set in vars.sh or env}"
     local release_catalog_ta_quay_token="${RELEASE_CATALOG_TA_QUAY_TOKEN:-}"
 
+    # Docker network mode: macOS does not support --network=host.
+    # On macOS, connect to the k3d Docker network for cluster access.
+    local docker_network_args
+    if [[ "$(uname)" == "Darwin" ]]; then
+        local cluster_name="${KIND_CLUSTER:-konflux}"
+        docker_network_args="--network=k3d-${cluster_name}"
+        echo "macOS detected: using Docker network k3d-${cluster_name}" >&2
+    else
+        docker_network_args="--network=host"
+    fi
+
+    # shellcheck disable=SC2086
     docker run \
-        --network=host \
+        ${docker_network_args} \
         -v ~/.kube/config:/kube/config \
         --env KUBECONFIG=/kube/config \
         -e GITHUB_TOKEN="$github_token" \

@@ -51,6 +51,14 @@ options:
       - arg: --node-label=ingress-ready=true
         nodeFilters:
           - "server:*"
+      # Reserve memory for system components (prevents OOM in constrained CI)
+      - arg: --kubelet-arg=system-reserved=memory=256Mi
+        nodeFilters:
+          - "server:*"
+      # Evict pods earlier when memory is low (CI runners have limited RAM)
+      - arg: --kubelet-arg=eviction-hard=memory.available<200Mi
+        nodeFilters:
+          - "server:*"
 
 # Host ↔ container port mappings (equivalent to kind extraPortMappings)
 ports:

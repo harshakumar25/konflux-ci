@@ -1,40 +1,55 @@
-# Smoke test: k3d cluster on macOS GitHub runner
+# macOS E2E Tests with k3d — Konflux CI Issue #5194
 #
-# PURPOSE: Verify whether Docker + k3d can work on GitHub's macOS runners.
-# This is an experimental workflow to answer the question:
-#   "Did you try running the e2e tests in CI in your fork?"
+# This workflow runs the full Konflux e2e test pipeline on a macOS GitHub
+# runner using k3d (K3s-in-Docker) as a lightweight cluster provider.
 #
-# KNOWN LIMITATION:
-#   GitHub does not officially support Docker on macOS runners.
-#   - macos-14/15 (ARM64 M1): No nested virtualization → Docker/Colima fails
-#   - macos-13 (Intel x86_64): Docker removed, but Colima may still work
-#   - macos-13 is being retired Dec 2025
+# Architecture:
+#   Runner:  macos-15-intel (Intel x86_64, 14 GB RAM, VT-x capable)
+#   Docker:  Colima with QEMU backend (Intel VT-x virtualization)
+#   Cluster: k3d with embedded etcd (~3 GB vs Kind's ~12 GB)
 #
-# This workflow tries macos-13 with Colima as a Docker runtime.
-# If it fails, that proves the platform limitation is real.
-# If it works, we have CI proof of the k3d prototype.
+# Pipeline stages:
+#   1. Install tools (Colima, Docker, k3d, kubectl, Go)
+#   2. Create k3d cluster via setup-k3d-cluster.sh
+#   3. Deploy full Konflux via deploy-local.sh
+#   4. Deploy test resources
+#   5. Run integration tests (test/go-tests)
+#   6. Run e2e tests (test/e2e/run-e2e.sh)
+#   7. Memory benchmarks at each stage (uploaded as artifact)
+#
+# Memory strategy:
+#   Colima VM: 10 GB (leaves ~4 GB for macOS host)
+#   k3d idle:  ~535 MiB (vs Kind ~2-3 GB)
+#   Full stack: ~3 GB → ~11 GB headroom for pipeline workloads
+#   Kyverno policy: reduces TaskRun requests to 1Mi CPU / 1m memory
+#
+# Note: --network=host is not supported on macOS Docker. E2E test runner
+# uses the k3d Docker network instead.
 
-name: k3d macOS Smoke Test
+name: macOS E2E Tests (k3d)
 
 on:
   push:
     branches:
       - k3d-macos-prototype
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:
 
 jobs:
-  test-k3d-macos:
-    name: k3d Smoke Test (macOS)
-    runs-on: macos-13  # Intel x86_64 — only runner where Docker might work
-    timeout-minutes: 30
+  macos-e2e:
+    name: E2E Tests (macOS Intel + k3d)
+    runs-on: macos-15-intel
+    timeout-minutes: 45
     env:
-      KIND_CLUSTER: konflux-ci-test
+      KIND_CLUSTER: konflux
       CLUSTER_PROVIDER: k3d
+      COLIMA_MEMORY: 10
+      COLIMA_CPU: 3
+      COLIMA_DISK: 30
+      # renovate: datasource=github-releases depName=kubernetes/kubernetes
+      KUBECTL_VERSION: "1.35.2"
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
+      # ── System info ──────────────────────────────────────────────────
       - name: System info
         run: |
           echo "=== macOS Version ==="
@@ -48,130 +63,219 @@ jobs:
           echo ""
           echo "=== CPU ==="
           sysctl -n hw.ncpu | awk '{printf "CPUs: %s\n", $1}'
+          echo ""
+          echo "=== Disk ==="
+          df -h /
 
+      # ── Checkout ─────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Install Docker via Colima ────────────────────────────────────
       - name: Install Docker via Colima
         run: |
           echo "=== Installing Colima and Docker CLI ==="
-          brew install colima docker
+          brew install colima docker docker-compose
           echo ""
-          echo "=== Starting Colima VM (8GB RAM, 4 CPUs) ==="
-          # Allocate 8 GB to the VM — leaves ~6 GB for the host
-          colima start --memory 8 --cpu 4 --disk 20
+          echo "=== Starting Colima VM ==="
+          echo "  Memory: ${COLIMA_MEMORY} GB"
+          echo "  CPUs:   ${COLIMA_CPU}"
+          echo "  Disk:   ${COLIMA_DISK} GB"
+          echo ""
+          # Use QEMU on Intel — Colima needs a Linux VM to provide Docker
+          colima start \
+            --memory "${COLIMA_MEMORY}" \
+            --cpu "${COLIMA_CPU}" \
+            --disk "${COLIMA_DISK}" \
+            --vm-type qemu \
+            --mount-type 9p
           echo ""
           echo "=== Verify Docker ==="
           docker info
           docker version
+          echo ""
+          echo "=== Docker system resources ==="
+          docker system info --format '{{.MemTotal}}' 2>/dev/null || echo "(unable to read)"
 
+      # ── Install k3d ──────────────────────────────────────────────────
       - name: Install k3d
         run: |
           brew install k3d
           k3d version
 
-      - name: Create k3d cluster with embedded etcd
+      # ── Install kubectl ──────────────────────────────────────────────
+      - name: Install kubectl
         run: |
-          echo "=== Creating k3d cluster ==="
-          CLUSTER_PROVIDER=k3d KIND_CLUSTER=$KIND_CLUSTER \
+          curl -LO "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/darwin/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+      # ── Setup Go ─────────────────────────────────────────────────────
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: operator/go.mod
+          cache-dependency-path: operator/go.sum
+
+      # ── Memory benchmark: baseline ───────────────────────────────────
+      - name: "📊 Memory: baseline (before cluster)"
+        run: |
+          mkdir -p logs
+          bash scripts/benchmark-memory.sh "01-baseline" | tee logs/memory-01-baseline.log
+
+      # ── Create k3d cluster ───────────────────────────────────────────
+      - name: Create k3d cluster
+        run: |
+          CLUSTER_PROVIDER=k3d KIND_CLUSTER="${KIND_CLUSTER}" \
             bash scripts/setup-k3d-cluster.sh
 
-      - name: Verify cluster health
+      - name: Verify cluster
         run: |
-          echo "=== Cluster info ==="
-          kubectl cluster-info --context k3d-${KIND_CLUSTER}
+          kubectl cluster-info --context "k3d-${KIND_CLUSTER}"
           echo ""
-          echo "=== Nodes (look for 'etcd' in ROLES) ==="
-          kubectl get nodes -o wide --context k3d-${KIND_CLUSTER}
+          echo "=== Nodes (check for etcd in ROLES) ==="
+          kubectl get nodes -o wide
           echo ""
           echo "=== System pods ==="
-          kubectl get pods -A --context k3d-${KIND_CLUSTER}
+          kubectl get pods -A
 
-      - name: Memory baseline (idle cluster)
-        run: |
-          echo "=== Container memory (idle) ==="
-          docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}"
+      # ── Memory benchmark: after cluster ──────────────────────────────
+      - name: "📊 Memory: after cluster creation"
+        run: bash scripts/benchmark-memory.sh "02-cluster-created" | tee logs/memory-02-cluster.log
 
-      - name: Deploy Konflux dependencies
-        run: |
-          echo "=== Running deploy-deps.sh ==="
-          ./deploy-deps.sh
-        timeout-minutes: 15
+      # ── Deploy full Konflux ──────────────────────────────────────────
+      - name: Deploy Konflux (full stack)
+        env:
+          KIND_CLUSTER: ${{ env.KIND_CLUSTER }}
+          CLUSTER_PROVIDER: k3d
+          OPERATOR_INSTALL_METHOD: "build"
+          OPERATOR_IMAGE: "example.com/konflux-operator:v0.0.1"
+          KONFLUX_CR: "operator/config/samples/konflux-e2e.yaml"
+          GITHUB_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          GITHUB_APP_ID: ${{ secrets.APP_ID }}
+          WEBHOOK_SECRET: ${{ secrets.APP_WEBHOOK_SECRET }}
+          QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
+          QUAY_ORGANIZATION: ${{ secrets.QUAY_ORG }}
+          SMEE_CHANNEL: ${{ secrets.SMEE_CHANNEL }}
+        run: ./scripts/deploy-local.sh
+        timeout-minutes: 20
 
+      # ── Memory benchmark: after deploy ───────────────────────────────
+      - name: "📊 Memory: after full deployment"
+        run: bash scripts/benchmark-memory.sh "03-full-deploy" | tee logs/memory-03-deploy.log
+
+      # ── Verify deployments ───────────────────────────────────────────
       - name: Verify all deployments
         run: |
           echo "=== All pods ==="
-          kubectl get pods -A --context k3d-${KIND_CLUSTER}
+          kubectl get pods -A
           echo ""
           echo "=== Deployment status ==="
-          kubectl get deployments -A --context k3d-${KIND_CLUSTER}
+          kubectl get deployments -A
           echo ""
-          echo "=== Check for non-Running pods ==="
-          NOT_RUNNING=$(kubectl get pods -A --context k3d-${KIND_CLUSTER} --no-headers | grep -v "Running\|Completed" | wc -l | tr -d ' ')
+          echo "=== Non-Running pods ==="
+          NOT_RUNNING=$(kubectl get pods -A --no-headers | grep -v "Running\|Completed" | wc -l | tr -d ' ')
           echo "Non-running pods: ${NOT_RUNNING}"
           if [ "${NOT_RUNNING}" -gt 0 ]; then
             echo "WARNING: Some pods are not running"
-            kubectl get pods -A --context k3d-${KIND_CLUSTER} --no-headers | grep -v "Running\|Completed"
+            kubectl get pods -A --no-headers | grep -v "Running\|Completed"
           fi
 
-      - name: Memory after full deployment
-        run: |
-          echo "=== Container memory (post deploy-deps) ==="
-          docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}"
-          echo ""
-          echo "=== Colima VM stats ==="
-          colima status
+      # ── Deploy test resources ────────────────────────────────────────
+      - name: Deploy test resources
+        env:
+          SKIP_SAMPLE_COMPONENTS: "true"
+        run: ./deploy-test-resources.sh
 
-      - name: Service reachability check
+      # ── Run integration tests ────────────────────────────────────────
+      - name: Run integration tests
         run: |
-          echo "=== Dex (port 8180) ==="
-          curl -s -o /dev/null -w "HTTP %{http_code}" http://localhost:8180/.well-known/openid-configuration || echo "Dex not reachable"
-          echo ""
-          echo "=== Registry (port 5001) ==="
-          curl -sk -o /dev/null -w "HTTP %{http_code}" https://localhost:5001/v2/ || echo "Registry not reachable (expected for TLS)"
-          echo ""
-          echo "=== UI (port 8888) ==="
-          curl -s -o /dev/null -w "HTTP %{http_code}" http://localhost:8888 || echo "UI not reachable"
+          cd test/go-tests
+          go test ./...
 
+      # ── Memory benchmark: after integration tests ────────────────────
+      - name: "📊 Memory: after integration tests"
+        run: bash scripts/benchmark-memory.sh "04-post-integration" | tee logs/memory-04-integration.log
+
+      # ── Run E2E tests ────────────────────────────────────────────────
+      - name: Run E2E tests
+        env:
+          GH_ORG: ${{ secrets.GH_ORG }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          QUAY_DOCKERCONFIGJSON: ${{ secrets.QUAY_DOCKERCONFIGJSON }}
+          RELEASE_CATALOG_TA_QUAY_TOKEN: ${{ secrets.RELEASE_CATALOG_TA_QUAY_TOKEN }}
+        run: ./test/e2e/run-e2e.sh
+
+      # ── Memory benchmark: after e2e (peak) ──────────────────────────
+      - name: "📊 Memory: after e2e tests (peak)"
+        if: ${{ !cancelled() }}
+        run: bash scripts/benchmark-memory.sh "05-post-e2e" | tee logs/memory-05-e2e.log
+
+      # ── Pipeline cleanup test ────────────────────────────────────────
+      - name: Test pipeline cleanup (arewm concern)
+        if: ${{ !cancelled() }}
+        run: |
+          echo "=== PipelineRuns before cleanup ==="
+          kubectl get pipelineruns -A 2>/dev/null || echo "No PipelineRuns found"
+          echo ""
+          echo "=== Cleaning up completed PipelineRuns ==="
+          kubectl delete pipelineruns -A --field-selector=status.conditions[0].reason=Succeeded 2>/dev/null || true
+          echo ""
+          echo "=== PipelineRuns after cleanup ==="
+          kubectl get pipelineruns -A 2>/dev/null || echo "No PipelineRuns found"
+          echo ""
+          echo "=== Memory after cleanup ==="
+          bash scripts/benchmark-memory.sh "06-post-cleanup" | tee logs/memory-06-cleanup.log
+
+      # ── Generate error logs ──────────────────────────────────────────
+      - name: Generate error logs
+        if: ${{ !cancelled() }}
+        run: |
+          echo "Konflux CR:"
+          kubectl get konflux konflux -o yaml || :
+          ./generate-err-logs.sh
+
+      # ── Upload artifacts ─────────────────────────────────────────────
+      - name: Upload logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-e2e-logs
+          path: logs/
+
+      # ── Summary ──────────────────────────────────────────────────────
       - name: Summary
         if: always()
         run: |
           echo ""
           echo "============================================"
-          echo "  k3d macOS CI Smoke Test — Summary"
+          echo "  macOS E2E Test — Summary"
           echo "============================================"
           echo ""
-          echo "Runner:       macos-13 (Intel x86_64)"
-          echo "Docker via:   Colima"
-          echo "k3d version:  $(k3d version | head -1)"
-          echo "Cluster:      ${KIND_CLUSTER}"
+          echo "Runner:       macos-15-intel"
+          echo "Docker via:   Colima (QEMU backend)"
+          echo "Cluster:      k3d with embedded etcd"
+          echo "Cluster name: ${KIND_CLUSTER}"
           echo ""
-          echo "Node roles:"
-          kubectl get nodes --context k3d-${KIND_CLUSTER} --no-headers 2>/dev/null || echo "  Cluster not available"
+          echo "Node info:"
+          kubectl get nodes -o wide 2>/dev/null || echo "  Cluster not available"
           echo ""
           echo "Pod summary:"
-          kubectl get pods -A --context k3d-${KIND_CLUSTER} --no-headers 2>/dev/null | awk '{print $4}' | sort | uniq -c || echo "  No data"
+          kubectl get pods -A --no-headers 2>/dev/null | awk '{print $4}' | sort | uniq -c || echo "  No data"
           echo ""
-          echo "Memory:"
-          docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}" 2>/dev/null || echo "  No data"
+          echo "=== Memory benchmarks ==="
+          for f in logs/memory-*.log; do
+            if [ -f "$f" ]; then
+              echo "--- $(basename "$f") ---"
+              grep -E "^(Stage|Docker|Colima)" "$f" 2>/dev/null || head -5 "$f"
+              echo ""
+            fi
+          done
 
-      - name: Generate error logs on failure
-        if: failure()
-        run: |
-          echo "=== Cluster state ==="
-          k3d cluster list || true
-          echo ""
-          echo "=== Docker containers ==="
-          docker ps -a || true
-          echo ""
-          echo "=== Colima status ==="
-          colima status || true
-          echo ""
-          echo "=== Colima logs (last 50 lines) ==="
-          colima log 2>&1 | tail -50 || true
-          echo ""
-          echo "=== Pod events ==="
-          kubectl get events -A --sort-by='.lastTimestamp' --context k3d-${KIND_CLUSTER} 2>/dev/null | tail -30 || true
-
+      # ── Cleanup ──────────────────────────────────────────────────────
       - name: Cleanup
         if: always()
         run: |
-          k3d cluster delete ${KIND_CLUSTER} 2>/dev/null || true
+          k3d cluster delete "${KIND_CLUSTER}" 2>/dev/null || true
           colima stop 2>/dev/null || true
