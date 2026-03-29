@@ -178,6 +178,7 @@ rules:
   - appstudio.redhat.com
   resources:
   - components
+  - components/status
   verbs:
   - get
   - list
@@ -187,7 +188,6 @@ rules:
 - apiGroups:
   - appstudio.redhat.com
   resources:
-  - components/status
   - imagerepositories
   - imagerepositories/status
   - releaseplanadmissions
@@ -344,17 +344,17 @@ data:
     default-pipeline-name: docker-build-oci-ta-min
     pipelines:
     - name: fbc-builder
-      bundle: quay.io/konflux-ci/tekton-catalog/pipeline-fbc-builder@sha256:db4b0a21c05d0a0699cdaf9638d053b244bcaecd75477541797a9cadb5fab48e
+      bundle: quay.io/konflux-ci/tekton-catalog/pipeline-fbc-builder@sha256:9adee3b0ad3600baf5bd580d10d3c7fbba0a338a1c3997a0e1c302f8c7322fc0
     - name: docker-build
-      bundle: quay.io/konflux-ci/tekton-catalog/pipeline-docker-build@sha256:104ece4de2851dfd9a418d1e89a4a596c459eea591152d0b4024cd4d5c982525
+      bundle: quay.io/konflux-ci/tekton-catalog/pipeline-docker-build@sha256:c64233419e9f74cba17b5fd9a3781778be39a23dcf8f0c2664b0a2e6c2a0ca88
     - name: docker-build-oci-ta
-      bundle: quay.io/konflux-ci/tekton-catalog/pipeline-docker-build-oci-ta@sha256:19d9b76cfca9a2b1d6848432030c31ef67ae2a7acf42c2d399494a65cfc3f0da
+      bundle: quay.io/konflux-ci/tekton-catalog/pipeline-docker-build-oci-ta@sha256:1da83d0ec99aae1f1d285019660ec91adc5e0a041032334696ceddc9793c42e4
     - name: tekton-bundle-builder
-      bundle: quay.io/konflux-ci/tekton-catalog/pipeline-tekton-bundle-builder@sha256:421882002dc5ebe753586da1fbd1d6b2ef3d34844d37e4e2d61d58c51ee75b6a
+      bundle: quay.io/konflux-ci/tekton-catalog/pipeline-tekton-bundle-builder@sha256:d2db37c675b9d8564f12b515a219dc3175ba548c21dca42e0199a8d031e3e7af
     - name: tekton-bundle-builder-oci-ta
-      bundle: quay.io/konflux-ci/tekton-catalog/pipeline-tekton-bundle-builder-oci-ta@sha256:b03bad786fa7f434e6fdd78473231b5328ab3f71594f8d538edb89a259a7bed2
+      bundle: quay.io/konflux-ci/tekton-catalog/pipeline-tekton-bundle-builder-oci-ta@sha256:1f519d52c497e9332973b992c23a01f671ddf08c751cd02feda0973828b192ac
     - name: docker-build-oci-ta-min
-      bundle: quay.io/konflux-ci/tekton-catalog/pipeline-docker-build-oci-ta-min@sha256:ec844602597497340d5a0d1c6fc8268ee176192d3ebaa54cfe28d59bba310ab9
+      bundle: quay.io/konflux-ci/tekton-catalog/pipeline-docker-build-oci-ta-min@sha256:1f0c74fa426266946d376a2f9733ed7ecc555361bbe7cd3042af84e0197b899f
       description: minimal version of the docker-build-oci-ta pipeline, which requires less compute resources. In addition, it doesn't contain tasks which require user provided secrets.
 kind: ConfigMap
 metadata:
@@ -414,7 +414,7 @@ spec:
         env:
         - name: PAC_WEBHOOK_URL
           value: http://pipelines-as-code-controller.pipelines-as-code.svc.cluster.local:8180
-        image: quay.io/konflux-ci/build-service:ca44d2b8386e0af3ce29d2dc2d639a4e8fae3199
+        image: quay.io/konflux-ci/build-service:39bbecdf39008e11d33e903b4b583bd14d11a4c1
         livenessProbe:
           httpGet:
             path: /healthz
