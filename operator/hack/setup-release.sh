@@ -22,12 +22,18 @@ Options:
   -t, --tenant-namespace    Source tenant namespace (default: default-tenant)
   -m, --managed-namespace   Managed namespace for releases (default: default-managed-tenant)
   -a, --application         Application name (default: sample-component)
+  -p, --product-name        Product name to add to the ReleaseNotes (default: --application)
+  -v, --product-version     Product version to add to the ReleaseNotes (default: 0.1)
   -c, --component           Component name (repeatable for multiple components;
                             if omitted, auto-detects all components from the application)
   -e, --conforma-policy     EnterpriseContractPolicy name to copy from
                             enterprise-contract-service namespace (default: default)
   -r, --release-name        Name for the ReleasePlan and ReleasePlanAdmission
                             resources (default: local-release)
+  -R, --catalog-revision    Release service catalog git revision (default: production)
+  -I, --image-name-prefix   Prefix for Quay image repository names. Must be unique
+                            across concurrent CI runs to avoid credential collisions.
+                            (default: auto-generated from managed namespace + random suffix)
   -h, --help                Show this help message
 
 Examples:
@@ -73,8 +79,11 @@ wait_for_imagerepository() {
 TENANT_NS="default-tenant"
 MANAGED_NS="default-managed-tenant"
 APPLICATION="sample-component"
+PRODUCT_VERSION="0.1"
 CONFORMA_POLICY="default"
 RELEASE_NAME="local-release"
+CATALOG_REVISION="production"
+IMAGE_NAME_PREFIX=""
 COMPONENTS=()
 
 while [[ $# -gt 0 ]]; do
@@ -91,6 +100,14 @@ while [[ $# -gt 0 ]]; do
             APPLICATION="$2"
             shift 2
             ;;
+        -p|--product-name)
+            PRODUCT_NAME="$2"
+            shift 2
+            ;;
+        -v|--product-version)
+            PRODUCT_VERSION="$2"
+            shift 2
+            ;;
         -c|--component)
             COMPONENTS+=("$2")
             shift 2
@@ -103,6 +120,14 @@ while [[ $# -gt 0 ]]; do
             RELEASE_NAME="$2"
             shift 2
             ;;
+        -R|--catalog-revision)
+            CATALOG_REVISION="$2"
+            shift 2
+            ;;
+        -I|--image-name-prefix)
+            IMAGE_NAME_PREFIX="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             ;;
@@ -112,6 +137,16 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Parse PRODUCT_NAME default value based on APPLICATION value (after args parsing)
+PRODUCT_NAME=${PRODUCT_NAME:-$APPLICATION}
+
+# Generate a unique image name prefix to avoid credential collisions between
+# concurrent CI runs that share the same Quay organization.
+if [[ -z "${IMAGE_NAME_PREFIX}" ]]; then
+    RANDOM_SUFFIX=$(od -An -tx1 -N3 /dev/urandom | tr -d ' ')
+    IMAGE_NAME_PREFIX="${MANAGED_NS}-${RANDOM_SUFFIX}"
+fi
 
 # Auto-detect components if none specified
 if [[ ${#COMPONENTS[@]} -eq 0 ]]; then
@@ -133,8 +168,12 @@ echo "🏗️  Setting up release resources"
 echo "   Tenant namespace:  ${TENANT_NS}"
 echo "   Managed namespace: ${MANAGED_NS}"
 echo "   Application:       ${APPLICATION}"
+echo "   Product Name:      ${PRODUCT_NAME}"
+echo "   Product Version:   ${PRODUCT_VERSION}"
 echo "   EC policy:         ${CONFORMA_POLICY}"
 echo "   Release name:      ${RELEASE_NAME}"
+echo "   Catalog revision:  ${CATALOG_REVISION}"
+echo "   Image name prefix: ${IMAGE_NAME_PREFIX}"
 echo "   Components:        ${COMPONENTS[*]}"
 echo ""
 
@@ -183,7 +222,7 @@ metadata:
   namespace: ${MANAGED_NS}
 spec:
   image:
-    name: ${MANAGED_NS}/trusted-artifacts
+    name: ${IMAGE_NAME_PREFIX}/trusted-artifacts
     visibility: public
 EOF
 
@@ -198,7 +237,7 @@ metadata:
   namespace: ${MANAGED_NS}
 spec:
   image:
-    name: ${MANAGED_NS}/${COMPONENT}
+    name: ${IMAGE_NAME_PREFIX}/${COMPONENT}
     visibility: public
 EOF
 done
@@ -334,6 +373,9 @@ spec:
           - latest
           - '{{ git_sha }}'
       components:${COMPONENTS_YAML}
+    releaseNotes:
+      product_name: '${PRODUCT_NAME}'
+      product_version: '${PRODUCT_VERSION}'
   pipeline:
     pipelineRef:
       resolver: git
@@ -343,10 +385,20 @@ spec:
         - name: url
           value: "https://github.com/konflux-ci/release-service-catalog.git"
         - name: revision
-          value: production
+          value: ${CATALOG_REVISION}
         - name: pathInRepo
           value: "pipelines/managed/push-to-external-registry/push-to-external-registry.yaml"
     serviceAccountName: release-pipeline
+    taskRunSpecs:
+      - pipelineTaskName: push-snapshot
+        stepSpecs:
+          - name: push-snapshot
+            computeResources:
+              requests:
+                cpu: 10m
+                memory: 256Mi
+              limits:
+                memory: 1Gi
 EOF
 
 # Step 12: Create ReleasePlan in tenant namespace
