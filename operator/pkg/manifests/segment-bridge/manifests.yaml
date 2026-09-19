@@ -12,6 +12,30 @@ metadata:
   namespace: segment-bridge
 ---
 apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/name: segment-bridge
+  name: segment-bridge-cursor
+  namespace: segment-bridge
+rules:
+- apiGroups:
+  - ""
+  resourceNames:
+  - segment-bridge-cursor
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   labels:
@@ -39,6 +63,18 @@ rules:
   verbs:
   - list
 - apiGroups:
+  - appstudio.redhat.com
+  resources:
+  - applications
+  verbs:
+  - list
+- apiGroups:
+  - appstudio.redhat.com
+  resources:
+  - releases
+  verbs:
+  - list
+- apiGroups:
   - config.openshift.io
   resources:
   - clusterversions
@@ -62,6 +98,22 @@ rules:
   - list
 ---
 apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: segment-bridge
+  name: segment-bridge-cursor
+  namespace: segment-bridge
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: segment-bridge-cursor
+subjects:
+- kind: ServiceAccount
+  name: segment-bridge
+  namespace: segment-bridge
+---
+apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   labels:
@@ -74,6 +126,16 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: segment-bridge
+  namespace: segment-bridge
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  annotations:
+    service.beta.openshift.io/inject-cabundle: "true"
+  labels:
+    app.kubernetes.io/name: segment-bridge
+  name: segment-bridge-tekton-results-service-ca
   namespace: segment-bridge
 ---
 apiVersion: batch/v1
@@ -90,11 +152,14 @@ spec:
       template:
         spec:
           containers:
-          - envFrom:
+          - env:
+            - name: TEKTON_RESULTS_CA_PATH
+              value: /var/run/segment-bridge/tekton-results-ca/service-ca.crt
+            envFrom:
             - secretRef:
                 name: segment-bridge-config
                 optional: true
-            image: quay.io/konflux-ci/segment-bridge:103cc986d3dc613df8ce46816e7e496a9d59dc6d8666ea95618d573dd96fb093
+            image: quay.io/konflux-ci/segment-bridge:c508710616dff539cc69e790351974d1c1035a1a8666ea95618d573dd96fb093
             imagePullPolicy: IfNotPresent
             name: segment-bridge
             resources:
@@ -113,6 +178,9 @@ spec:
             volumeMounts:
             - mountPath: /tmp
               name: tmp
+            - mountPath: /var/run/segment-bridge/tekton-results-ca
+              name: tekton-results-service-ca
+              readOnly: true
           restartPolicy: OnFailure
           securityContext:
             runAsNonRoot: true
@@ -122,4 +190,11 @@ spec:
           volumes:
           - emptyDir: {}
             name: tmp
+          - configMap:
+              items:
+              - key: service-ca.crt
+                path: service-ca.crt
+              name: segment-bridge-tekton-results-service-ca
+              optional: true
+            name: tekton-results-service-ca
   schedule: 0 * * * *
